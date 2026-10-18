@@ -368,7 +368,16 @@ npm publish --access public      # public package
 
 For a **private** package, use a scoped name such as `@your-org/cap-hana-vector-publisher` in `package.json`. Publish it with `npm publish` (scoped packages are private by default and need a paid npm org) and update the `using ... from '@your-org/cap-hana-vector-publisher'` lines to match.
 
-Release a new version with `npm version patch|minor|major` and then `npm publish`.
+### Automated releases (GitHub Actions)
+
+`.github/workflows/publish.yml` publishes to npm with provenance whenever a version tag is pushed. It first checks that the tag matches `package.json` and that the tests pass.
+
+```bash
+npm version patch                # or minor / major: bumps package.json, commits, tags vX.Y.Z
+git push --follow-tags           # the tag push triggers the publish workflow
+```
+
+The workflow authenticates with npm **trusted publishing** (OIDC) once you configure it under the package's *Settings → Trusted Publisher* on npmjs.com (workflow `publish.yml`, environment `npm`). Until then, it falls back to an `NPM_TOKEN` repository secret.
 
 ---
 
