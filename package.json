@@ -1,6 +1,6 @@
 {
   "name": "cap-hana-vector-publisher",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Plug-and-play SAP CAP utility that extracts text from PDF/TXT/MD uploads, chunks it with overlap, and stores the chunks with native SAP HANA Cloud vector embeddings (VECTOR_EMBEDDING).",
   "main": "index.js",
   "types": "index.d.ts",
@@ -49,6 +49,10 @@
     "@sap/cds": ">=7.8"
   },
   "devDependencies": {
-    "@sap/cds": "^8"
+    "@sap/cds": "^8",
+    "@cap-js/sqlite": "^1"
+  },
+  "overrides": {
+    "better-sqlite3": "^12"
   }
 }

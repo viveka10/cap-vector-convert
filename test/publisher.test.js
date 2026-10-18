@@ -5,14 +5,15 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const HanaVectorPublisher = require('..');
 
-function mockDb(kind = 'hana', { failOn } = {}) {
+function mockDb(kind = 'hana', opts = {}) {
+  const { failOn } = opts;
   return {
     kind,
     calls: [],
     async run(query, args) {
       this.calls.push({ query, args });
       if (failOn && failOn(query)) throw new Error('boom');
-      return 1;
+      return 'result' in opts ? opts.result : 1;
     },
     async tx(fn) {
       this.txCount = (this.txCount || 0) + 1;
@@ -161,6 +162,20 @@ test('embedPending without documentId embeds every pending row', async () => {
   assert.match(db.calls[0].query, / WHERE "EMBEDDING" IS NULL$/);
   assert.doesNotMatch(db.calls[0].query, /\?/);
   assert.equal(db.calls[0].args, undefined);
+});
+
+test('embedPending returns the row count for every driver result shape', async () => {
+  // CQL writes resolve to a number, plain SQL to { changes, lastInsertRowid }
+  const cases = [
+    [{ changes: 3, lastInsertRowid: 7 }, 3],
+    [3, 3],
+    [undefined, 0]
+  ];
+  for (const [result, expected] of cases) {
+    const publisher = new HanaVectorPublisher(mockDb('hana', { result }), { sqlTableName: 'T' });
+    assert.equal(await publisher.embedPending({ tableName: 'T', documentId: 'doc-1' }), expected);
+    assert.equal(await publisher.embedPending({ tableName: 'T' }), expected);
+  }
 });
 
 test('embedPending validates input and respects skipEmbeddings', async () => {

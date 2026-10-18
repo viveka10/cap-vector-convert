@@ -220,17 +220,42 @@ const top = await SELECT.from(DocumentChunks)
 
 By default `processAndStore` computes every embedding inside the caller's request. For documents with hundreds or thousands of chunks, the `VECTOR_EMBEDDING` update can take longer than typical approuter or SAP Build Work Zone route timeouts (about 30 s). The HTTP request then fails even though the work itself would have succeeded.
 
-To avoid this, store the chunks with `embed: false` and compute the vectors after the request has committed:
+To avoid this, store the chunks with `embed: false` and compute the vectors in the background once the request has committed:
 
 ```js
-// in the upload handler: fast, chunks only
-const r = await publisher.processAndStore({ fileBuffer, fileName, tableName, embed: false });
+this.on('uploadDocument', async req => {
+  const { fileName, mimeType, content } = req.data;
+  const r = await publisher.processAndStore({ fileBuffer: content, fileName, mimeType, tableName, embed: false });
 
-// after the request commits, in the background
-cds.spawn({ after: 0 }, () => publisher.embedPending({ tableName, documentId: r.documentId }));
+  // runs only after the request's transaction has committed
+  req.on('succeeded', () =>
+    cds.spawn(() => publisher.embedPending({ tableName, documentId: r.documentId }))
+  );
+
+  return { documentId: r.documentId, chunkCount: r.chunkCount };
+});
 ```
 
-`embedPending({ tableName })` without a `documentId` embeds every row in the table whose embedding is still `NULL`, which is useful in a periodic job that catches up after failures.
+**Why `req.on('succeeded')`:** `cds.spawn` runs in a new transaction, and HANA only shows committed rows to other transactions. If the background job starts before the request has committed (for example with `cds.spawn({ after: 0 }, …)` directly in the handler), its `UPDATE` matches no rows, `embedPending` returns `0`, and the chunks are never embedded. No error is raised. The `succeeded` event fires only after the request's transaction has committed.
+
+**Schedule a catch-up job.** A background job can still fail, for example if the NLP feature is disabled or the instance restarts while it runs. Schedule a periodic job that embeds every row still pending. `embedPending({ tableName })` without a `documentId` does exactly that:
+
+```js
+cds.spawn({ every: 15 * 60 * 1000 }, () => publisher.embedPending({ tableName }));
+```
+
+**Handle errors yourself if you need to.** `cds.spawn` only logs errors thrown by its callback. If your app needs to react to failures (alerting, marking the document as failed, …), catch `HanaVectorPublisherError` inside the callback:
+
+```js
+cds.spawn(async () => {
+  try {
+    await publisher.embedPending({ tableName, documentId });
+  } catch (err) {
+    if (err instanceof HanaVectorPublisherError) cds.log('embedding').error(`Embedding failed (${err.code})`, err);
+    else throw err;
+  }
+});
+```
 
 Until `embedPending` finishes, those chunks have `embedding IS NULL` and similarity search won't find them. Filter them out in your queries:
 
@@ -412,6 +437,11 @@ The workflow authenticates with npm **trusted publishing** (OIDC) once you confi
 ---
 
 ## Changelog
+
+### 1.1.1
+
+- `embedPending()` now returns the number of updated rows as a number (1.1.0 returned the database driver's result object).
+- README: the background embedding example now waits for the request to commit (`req.on('succeeded')`) and recommends a periodic catch-up job ([details](#large-documents-embed-in-the-background)).
 
 ### 1.1.0
 
