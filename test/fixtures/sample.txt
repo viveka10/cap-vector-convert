@@ -1,0 +1,5 @@
+Getting started with the document service
+
+Upload a file, then search it. The text is split into overlapping chunks.
+
+Each chunk is stored with its position, so search results can point back to the source document.

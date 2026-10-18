@@ -1,0 +1,16 @@
+{
+  "name": "vector-library-test-app",
+  "private": true,
+  "description": "1.1.x-style app: uses the VectorStore aspect and the library, without the plugin config",
+  "dependencies": {
+    "cap-hana-vector-publisher": "file:../.."
+  },
+  "cds": {
+    "requires": {
+      "db": {
+        "kind": "sqlite",
+        "credentials": { "url": ":memory:" }
+      }
+    }
+  }
+}

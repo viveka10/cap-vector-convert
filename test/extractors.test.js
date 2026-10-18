@@ -44,3 +44,16 @@ test('extracts text files', async () => {
 test('wraps PDF parser failures', async () => {
   await assert.rejects(extractText(Buffer.from('%PDF-1.4 not really a pdf'), { fileName: 'broken.pdf' }), { code: 'EXTRACTION_FAILED' });
 });
+
+test('parses small PDFs regardless of the state of the shared Buffer pool', async () => {
+  const pdf = require('fs').readFileSync(require('path').join(__dirname, 'fixtures', 'sample.pdf'));
+  assert.ok(pdf.length < 4096, 'the fixture must be small enough for pooled Buffers');
+  // a failed parse first moves the pool offset away from 0 (pdf.js copies Buffers into the pool)
+  await assert.rejects(extractText(Buffer.from('%PDF-1.4 not really a pdf'), { fileName: 'broken.pdf' }));
+  for (let i = 0; i < 3; i++) {
+    Buffer.allocUnsafe(100 + i); // shift the pool offset
+    const { text, pages } = await extractText(Buffer.from(pdf), { fileName: 'small.pdf' });
+    assert.equal(pages, 2);
+    assert.match(text, /pineapple/);
+  }
+});

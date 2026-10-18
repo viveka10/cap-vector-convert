@@ -67,6 +67,52 @@ export interface ProcessAndStoreResult {
   modelId?: string;
 }
 
+export interface SearchParams {
+  /** CDS entity name of the chunk table */
+  tableName: string;
+  /** Search text (max 2000 characters), embedded with the 'QUERY' embedding type */
+  query: string;
+  /** Max number of hits, integer 1-1000. Default 5 */
+  top?: number;
+  /** Restrict the search to one document */
+  documentId?: string;
+  /** Drop hits with a lower cosine similarity (applied after the query) */
+  minScore?: number;
+}
+
+export interface SearchHit {
+  ID: string;
+  documentId: string;
+  fileName?: string;
+  chunkIndex?: number;
+  content: string;
+  /** Cosine similarity; null for the text-match fallback on non-HANA databases */
+  score: number | null;
+}
+
+/** cds.requires['hana-vector-publisher'] when the app enables the CAP plugin */
+export interface PluginConfig {
+  kind?: 'hana-vector-publisher';
+  /** 'cap-hana-vector-publisher/srv' (entities + service, default) or 'cap-hana-vector-publisher/db' (entities only) */
+  model?: string;
+  /** Upload limit in bytes, passed as publisher.maxFileSize. Default 10 MB */
+  maxFileSize?: number;
+  embedding?: {
+    /** 'background' (default): embed after the upload request committed. 'sync': embed inside the request */
+    mode?: 'background' | 'sync';
+    /** Interval of the catch-up job in ms; 0 or false disables it. Default 900000 (15 min) */
+    catchUpInterval?: number | false;
+  };
+  search?: {
+    /** Default 5 */
+    defaultTop?: number;
+    /** Default 50, at most 1000 */
+    maxTop?: number;
+  };
+  /** Any HanaVectorPublisher option. onUnsupportedDatabase defaults to 'skipEmbeddings' on non-HANA databases */
+  publisher?: HanaVectorPublisherOptions;
+}
+
 export declare class HanaVectorPublisher {
   constructor(db: any, options?: HanaVectorPublisherOptions);
   readonly db: any;
@@ -79,6 +125,10 @@ export declare class HanaVectorPublisher {
   /** Embeds chunks whose embedding is NULL (one document, or the whole table). Returns the updated row count */
   embedPending(params: { tableName: string; documentId?: string }): Promise<number>;
   buildEmbeddingSql(tableName: string, opts?: { allPending?: boolean }): string;
+  /** Similarity search, best match first. Falls back to a text match on non-HANA databases with onUnsupportedDatabase: 'skipEmbeddings' */
+  search(params: SearchParams): Promise<SearchHit[]>;
+  /** The parameterised search statement; parameters are [query] or, with withDocument, [query, documentId] */
+  buildSearchSql(tableName: string, opts?: { withDocument?: boolean; top?: number }): string;
 }
 
 export declare const ERROR_CODES: Readonly<{
@@ -92,6 +142,7 @@ export declare const ERROR_CODES: Readonly<{
   UNSUPPORTED_DATABASE: 'UNSUPPORTED_DATABASE';
   DB_INSERT_FAILED: 'DB_INSERT_FAILED';
   EMBEDDING_FAILED: 'EMBEDDING_FAILED';
+  SEARCH_FAILED: 'SEARCH_FAILED';
 }>;
 
 export declare class HanaVectorPublisherError extends Error {

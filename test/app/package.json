@@ -1,0 +1,27 @@
+{
+  "name": "vector-plugin-test-app",
+  "private": true,
+  "description": "Minimal CAP app that opts in to the cap-hana-vector-publisher plugin (used by the tests; also runs with `cds watch`)",
+  "dependencies": {
+    "cap-hana-vector-publisher": "file:../.."
+  },
+  "cds": {
+    "requires": {
+      "hana-vector-publisher": true,
+      "db": {
+        "kind": "sqlite",
+        "credentials": { "url": ":memory:" }
+      },
+      "auth": {
+        "kind": "mocked",
+        "users": {
+          "admin": { "password": "admin", "roles": ["DocumentAdminRole"] },
+          "reader": { "password": "reader", "roles": [] }
+        }
+      }
+    },
+    "server": {
+      "body_parser": { "limit": "20mb" }
+    }
+  }
+}

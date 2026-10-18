@@ -193,3 +193,105 @@ test('embedPending wraps database errors in EMBEDDING_FAILED', async () => {
   const publisher = new HanaVectorPublisher(mockDb('hana', { failOn: () => true }));
   await assert.rejects(publisher.embedPending({ tableName: 'T', documentId: 'doc-1' }), { code: 'EMBEDDING_FAILED', status: 500 });
 });
+
+// ------------------------------------------------------------------ search (1.2.0)
+
+test('buildSearchSql with and without document filter', () => {
+  const publisher = new HanaVectorPublisher(mockDb(), { sqlTableName: 'T' });
+  assert.equal(
+    publisher.buildSearchSql('T'),
+    `SELECT "ID" AS "ID", "DOCUMENTID" AS "documentId", "FILENAME" AS "fileName", "CHUNKINDEX" AS "chunkIndex", "CONTENT" AS "content", ` +
+      `COSINE_SIMILARITY("EMBEDDING", TO_REAL_VECTOR(VECTOR_EMBEDDING(?, 'QUERY', 'SAP_NEB.20240715'))) AS "score" ` +
+      `FROM "T" WHERE "EMBEDDING" IS NOT NULL ORDER BY "score" DESC LIMIT 5`
+  );
+  assert.match(publisher.buildSearchSql('T', { withDocument: true, top: 12 }), / WHERE "EMBEDDING" IS NOT NULL AND "DOCUMENTID" = \? ORDER BY "score" DESC LIMIT 12$/);
+  assert.match(new HanaVectorPublisher(mockDb()).buildSearchSql('my.app.Chunks'), / FROM "MY_APP_CHUNKS" /);
+});
+
+test('buildSearchSql respects wrapToRealVector, modelId and the column mapping', () => {
+  const publisher = new HanaVectorPublisher(mockDb(), {
+    sqlTableName: 'CUSTOM',
+    wrapToRealVector: false,
+    modelId: 'MY_MODEL.1',
+    columns: { id: null, fileName: null, chunkIndex: 'pos', content: 'text', embedding: 'vec', documentId: 'docId' }
+  });
+  assert.equal(
+    publisher.buildSearchSql('ignored', { withDocument: true }),
+    `SELECT "DOCID" AS "documentId", "POS" AS "chunkIndex", "TEXT" AS "content", ` +
+      `COSINE_SIMILARITY("VEC", VECTOR_EMBEDDING(?, 'QUERY', 'MY_MODEL.1')) AS "score" ` +
+      `FROM "CUSTOM" WHERE "VEC" IS NOT NULL AND "DOCID" = ? ORDER BY "score" DESC LIMIT 5`
+  );
+});
+
+test('buildSearchSql and search reject a top that is not an integer between 1 and 1000', async () => {
+  const db = mockDb();
+  const publisher = new HanaVectorPublisher(db, { sqlTableName: 'T' });
+  for (const top of [0, -1, 1.5, '5; DROP TABLE T', '5', 1001, NaN, null]) {
+    assert.throws(() => publisher.buildSearchSql('T', { top }), { code: 'INVALID_INPUT', status: 400 }, String(top));
+    await assert.rejects(publisher.search({ tableName: 'T', query: 'q', top }), { code: 'INVALID_INPUT', status: 400 }, String(top));
+  }
+  assert.equal(db.calls.length, 0);
+});
+
+test('search binds the query (and documentId) as parameters and returns hits best first', async () => {
+  const rows = [
+    { ID: 'c1', documentId: 'd1', fileName: 'a.pdf', chunkIndex: 0, content: 'x', score: 0.9 },
+    { ID: 'c2', documentId: 'd1', fileName: 'a.pdf', chunkIndex: 1, content: 'y', score: '0.4' }
+  ];
+  const db = mockDb('hana', { result: rows });
+  const publisher = new HanaVectorPublisher(db, { sqlTableName: 'T' });
+
+  const hits = await publisher.search({ tableName: 'T', query: "what's new?" });
+  assert.deepEqual(db.calls[0].args, ["what's new?"]);
+  assert.doesNotMatch(db.calls[0].query, /what/);
+  assert.deepEqual(hits, [
+    { ID: 'c1', documentId: 'd1', fileName: 'a.pdf', chunkIndex: 0, content: 'x', score: 0.9 },
+    { ID: 'c2', documentId: 'd1', fileName: 'a.pdf', chunkIndex: 1, content: 'y', score: 0.4 }
+  ]);
+
+  await publisher.search({ tableName: 'T', query: 'q', documentId: 'd1', top: 3 });
+  assert.deepEqual(db.calls[1].args, ['q', 'd1']);
+  assert.match(db.calls[1].query, /"DOCUMENTID" = \? ORDER BY "score" DESC LIMIT 3$/);
+
+  const filtered = await publisher.search({ tableName: 'T', query: 'q', minScore: 0.5 });
+  assert.deepEqual(filtered.map(h => h.ID), ['c1']);
+});
+
+test('search validates its input', async () => {
+  const publisher = new HanaVectorPublisher(mockDb());
+  for (const params of [
+    {},
+    { tableName: 'T' },
+    { tableName: 'T', query: '' },
+    { tableName: 'T', query: '   ' },
+    { tableName: 'T', query: 42 },
+    { tableName: 'T', query: 'x'.repeat(2001) },
+    { tableName: 'T', query: 'q', documentId: '' },
+    { tableName: 'T', query: 'q', minScore: 'high' }
+  ]) {
+    await assert.rejects(publisher.search(params), { code: 'INVALID_INPUT', status: 400 }, JSON.stringify(params));
+  }
+});
+
+test('search wraps database errors in SEARCH_FAILED', async () => {
+  const publisher = new HanaVectorPublisher(mockDb('hana', { failOn: () => true }), { sqlTableName: 'T' });
+  await assert.rejects(publisher.search({ tableName: 'T', query: 'q' }), { code: 'SEARCH_FAILED', status: 500 });
+});
+
+test('search on non-HANA databases: UNSUPPORTED_DATABASE, or a text match with skipEmbeddings', async () => {
+  await assert.rejects(new HanaVectorPublisher(mockDb('sqlite')).search({ tableName: 'T', query: 'q' }), { code: 'UNSUPPORTED_DATABASE' });
+
+  const db = mockDb('sqlite', { result: [{ ID: 'c1', documentId: 'd1', fileName: 'a.txt', chunkIndex: 0, content: 'Hello World' }] });
+  const publisher = new HanaVectorPublisher(db, { onUnsupportedDatabase: 'skipEmbeddings', columns: { fileName: null } });
+  const hits = await publisher.search({ tableName: 'my.app.Chunks', query: ' World ', documentId: 'd1', top: 7 });
+  assert.deepEqual(hits, [{ ID: 'c1', documentId: 'd1', fileName: 'a.txt', chunkIndex: 0, content: 'Hello World', score: null }]);
+
+  const { SELECT } = db.calls[0].query;
+  assert.equal(SELECT.from.ref[0], 'my.app.Chunks');
+  assert.deepEqual(SELECT.columns.map(c => c.as), ['ID', 'documentId', 'chunkIndex', 'content']);
+  assert.deepEqual(SELECT.limit.rows, { val: 7 });
+  const where = JSON.stringify(SELECT.where);
+  assert.match(where, /"func":"contains"/);
+  assert.match(where, /"val":"world"/);
+  assert.match(where, /"val":"d1"/);
+});

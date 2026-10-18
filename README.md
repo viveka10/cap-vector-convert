@@ -1,6 +1,11 @@
 # cap-hana-vector-publisher
 
-Upload a **PDF, TXT or Markdown** file in your SAP CAP app and get it stored in **SAP HANA Cloud** as text chunks with vector embeddings. You add one aspect to your schema and call one method in your handler.
+Upload a **PDF, TXT or Markdown** file in your SAP CAP app and get it stored in **SAP HANA Cloud** as text chunks with vector embeddings, then find the relevant chunks with similarity search.
+
+Use it in one of two ways:
+
+- **[Plugin mode](#quick-start-plugin-mode)** (new in 1.2.0): add one config entry and get a ready-to-use document service for upload, list, delete, search and re-embedding.
+- **[Library mode](#using-only-the-library)**: add one aspect to your schema and call one method in your own handler.
 
 The embeddings are computed **inside HANA** with `VECTOR_EMBEDDING(..., 'DOCUMENT', 'SAP_NEB.20240715')`, so you don't need an external embedding API, API key or extra service binding.
 
@@ -13,6 +18,8 @@ upload ─► extract text ─► normalize ─► chunk (with overlap) ─► I
 ## Contents
 
 - [Requirements](#requirements)
+- [Quick start: plugin mode](#quick-start-plugin-mode)
+- [Using only the library](#using-only-the-library)
 - [Installation](#installation)
 - [1. Extend your schema](#1-extend-your-schema)
 - [2. Use it in a service handler](#2-use-it-in-a-service-handler)
@@ -38,6 +45,160 @@ upload ─► extract text ─► normalize ─► chunk (with overlap) ─► I
 | SAP HANA Cloud | The **Natural Language Processing (NLP)** additional feature must be enabled on the instance (HANA Cloud Central → *Manage Configuration* → *Additional Features*) |
 
 ---
+
+## Quick start: plugin mode
+
+Since 1.2.0 the package is also a **CAP plugin**. When you turn it on, your app gets a ready-to-use document service for upload, list, delete, search and re-embedding, plus the entities behind it. You don't write any handlers. Nothing changes until you opt in: without the config entry below, the plugin adds no entities, tables, services, endpoints or background jobs, and the [library](#using-only-the-library) works as before.
+
+### 1. Install
+
+```bash
+npm i cap-hana-vector-publisher
+```
+
+### 2. Turn it on
+
+In your app's `package.json`:
+
+```json
+"cds": {
+  "requires": { "hana-vector-publisher": true },
+  "server": { "body_parser": { "limit": "15mb" } }
+}
+```
+
+`true` uses the defaults that the package declares as a `cds.requires.kinds` entry. Run `cds env requires.hana-vector-publisher` to see the resolved configuration. To override some of them, add `kind` and the values you want to change:
+
+```json
+"cds": {
+  "requires": {
+    "hana-vector-publisher": {
+      "kind": "hana-vector-publisher",
+      "maxFileSize": 20971520,
+      "embedding": { "mode": "sync" },
+      "publisher": { "chunkSize": 800, "chunkOverlap": 100 }
+    }
+  }
+}
+```
+
+The configuration is validated when the server starts. An invalid value, such as `chunkOverlap >= chunkSize`, stops the server with `INVALID_OPTIONS`, so you find out at startup rather than on the first upload.
+
+**Request body limit.** The file arrives as base64 inside a JSON body, which is about 33 % larger than the file itself. Set `cds.server.body_parser.limit` to at least `maxFileSize × 1.4`, for example `"15mb"` for the default 10 MB limit. CAP's default is express' `100kb`, so without this setting larger uploads fail before they reach the service. The plugin logs a warning at startup when the limit is too small. To raise the limit for this service only, annotate it instead:
+
+```cds
+using { VectorDocumentService } from 'cap-hana-vector-publisher/srv';
+annotate VectorDocumentService with @cds.server.body_parser.limit: '15mb';
+```
+
+### 3. Deploy
+
+`cds deploy` (SQLite) or `cds build --production` (HANA) pick up the plugin's model automatically. It adds two tables:
+
+| Entity | Table | Content |
+| --- | --- | --- |
+| `cap.hana.vector.Documents` | `CAP_HANA_VECTOR_DOCUMENTS` | One row per uploaded document (file info, counters, status) |
+| `cap.hana.vector.DocumentChunks` | `CAP_HANA_VECTOR_DOCUMENTCHUNKS` | One row per chunk (the `VectorStore` aspect); `documentId` = `Documents.ID` |
+
+**HDI users:** `cds build` generates the `.hdbtable` files for both tables into your db module, just as it does for your own entities. If you grant access to your container's objects with roles, synonyms or `.hdbgrants`, add these two table names.
+
+### 4. Call the service
+
+The service is served at `/vector` (OData V4).
+
+```http
+### Upload: content is the file as base64
+POST /vector/upload
+Content-Type: application/json
+
+{ "fileName": "handbook.pdf", "mimeType": "application/pdf", "content": "JVBERi0xLjcK...", "metadata": "{\"department\":\"HR\"}" }
+
+### -> { "documentId": "6f1c…", "status": "PENDING", "chunkCount": 42, "pageCount": 12 }
+
+### Replace a document: new file, same ID
+POST /vector/upload
+Content-Type: application/json
+
+{ "fileName": "handbook-v2.pdf", "content": "JVBERi0xLjcK...", "documentId": "6f1c…", "replace": true }
+
+### List documents, with or without their chunks (the embedding vector is never exposed)
+GET /vector/Documents?$orderby=createdAt desc
+GET /vector/Documents(6f1c…)?$expand=chunks
+GET /vector/Chunks?$filter=documentId eq 6f1c…&$orderby=chunkIndex
+
+### Similarity search, best match first (top and documentId are optional)
+GET /vector/search(query='How many vacation days do I get?',top=5)
+
+### -> { "value": [ { "documentId": "6f1c…", "chunkId": "…", "fileName": "handbook.pdf",
+###                   "chunkIndex": 17, "content": "…", "score": 0.83 } ] }
+
+### Delete a document and its chunks; returns the number of deleted chunks
+POST /vector/deleteDocument
+Content-Type: application/json
+
+{ "documentId": "6f1c…" }
+
+### Re-run embedding for one document, or for every pending chunk when documentId is omitted
+POST /vector/embedPending
+Content-Type: application/json
+
+{ "documentId": "6f1c…" }
+```
+
+Errors come back as OData errors with the status of the underlying [`HanaVectorPublisherError`](#error-handling): `400` invalid input (for example `replace` without `documentId`, or an empty query), `404` unknown document, `409` the `documentId` already exists and `replace` is not set, `413` file too large, `415` unsupported file type, `422` no text found (for example a scanned PDF), and `500` database or embedding errors. A failed upload stores nothing.
+
+### 5. Secure the service
+
+`VectorDocumentService` requires an authenticated user (`@requires: 'authenticated-user'`). Restrict it further, or move it, from your own CDS files:
+
+```cds
+using { VectorDocumentService } from 'cap-hana-vector-publisher/srv';
+annotate VectorDocumentService with @requires: 'DocumentAdminRole' @path: '/documents';
+
+// or: let every user search, but only admins change documents
+annotate VectorDocumentService with @requires: 'authenticated-user';
+annotate VectorDocumentService.upload with @requires: 'DocumentAdminRole';
+annotate VectorDocumentService.deleteDocument with @requires: 'DocumentAdminRole';
+annotate VectorDocumentService.embedPending with @requires: 'DocumentAdminRole';
+```
+
+### 6. Configuration
+
+All keys are optional. They go under `cds.requires.hana-vector-publisher`.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `model` | `cap-hana-vector-publisher/srv` | `…/srv` loads the entities and the service. `…/db` loads only the entities and serves no endpoint; use the [library](#using-only-the-library) from your own service with `tableName: 'cap.hana.vector.DocumentChunks'`. |
+| `maxFileSize` | `10485760` (10 MB) | Upload limit in bytes. It is passed to the publisher as `maxFileSize` and takes precedence over `publisher.maxFileSize`. |
+| `embedding.mode` | `background` | `background`: store the chunks and compute the embeddings after the request has committed. `sync`: compute them inside the upload request, as in 1.1.x. Use this only for small files, see [why](#large-documents-embed-in-the-background). |
+| `embedding.catchUpInterval` | `900000` (15 min) | Interval of the catch-up job in ms. `0` or `false` turns it off. |
+| `search.defaultTop` / `search.maxTop` | `5` / `50` | Default and maximum number of search hits. A larger `top`, or `defaultTop`, is reduced to `maxTop`. `maxTop` can be at most 1000. |
+| `publisher` | `{}` | Any [`HanaVectorPublisher` option](#options), e.g. `chunkSize`, `chunkOverlap`, `modelId`, `batchSize`. `onUnsupportedDatabase` defaults to `'skipEmbeddings'` on databases other than HANA and to `'throw'` on HANA; a value you set yourself wins. |
+
+### 7. Document statuses and the catch-up job
+
+| `Documents.status` | Meaning |
+| --- | --- |
+| `PENDING` | The chunks are stored; the embeddings are not computed yet (`background` mode). |
+| `EMBEDDED` | Every chunk has an embedding. `embeddedAt` and `modelId` are set. |
+| `FAILED` | Computing the embeddings failed. `statusMessage` has the reason, for example a disabled NLP feature. |
+| `SKIPPED` | The database has no `VECTOR_EMBEDDING` (SQLite, local development). The chunks are stored without vectors. |
+
+In `background` mode the upload returns `PENDING`. When the request has committed, the plugin starts the embedding with `req.on('succeeded', () => cds.spawn(...))` and sets the status to `EMBEDDED` or `FAILED`. While a document is `PENDING`, search doesn't find it yet.
+
+**Catch-up job.** On HANA, the plugin runs a job every `catchUpInterval` ms once the server has started. The job embeds every chunk that is still missing an embedding, for example after a `FAILED` run or a restart in the middle of an embedding, and marks the affected documents `EMBEDDED`. Errors are logged and never stop the server. The job does not run during `cds build`, `cds compile` or `cds deploy`. **With several app instances, every instance runs the job.** That is safe because the statement only touches rows `WHERE "EMBEDDING" IS NULL`; at worst some work is repeated. To retry right away, call `embedPending`.
+
+### Local development (plugin)
+
+On SQLite the service works without vectors. Uploads are stored with status `SKIPPED`, `embedPending` returns `0`, and `search` falls back to a case-insensitive substring match on the chunk text with `score: null`; a warning is logged once. For real similarity search, run against HANA Cloud with `cds watch --profile hybrid`.
+
+With `@sap/cds` 8 (cds-compiler 5), the `Vector` type can only be deployed to HANA. On other databases, the plugin turns the `embedding` element of its own chunk entity into a `LargeString` when the model loads, so `cds deploy` and `cds watch` work on SQLite. It doesn't do this during `cds build`, on HANA, or with cds-compiler 6, so HANA artifacts always get the real vector column.
+
+---
+
+## Using only the library
+
+Everything below works as in 1.1.x, with or without the plugin config. Use the library when you want your own entities, service and handlers.
 
 ## Installation
 
@@ -203,7 +364,33 @@ this.on('UPDATE', 'Documents', async (req, next) => {
 
 ## 3. Query by similarity (RAG)
 
-The search side is short, so the package doesn't wrap it. Embed the question with the same model, using `'QUERY'`:
+`publisher.search()` embeds the question with the same model (embedding type `'QUERY'`) and returns the closest chunks, best match first:
+
+```js
+const hits = await publisher.search({
+  tableName: 'my.app.DocumentChunks',
+  query: 'How many vacation days do I get?',
+  top: 5,                // integer 1-1000, default 5
+  documentId,            // optional: search one document only
+  minScore: 0.6          // optional: drop weaker hits (applied after the query)
+});
+// [{ ID, documentId, fileName, chunkIndex, content, score }, ...]
+```
+
+It runs a single parameterised statement, built by `publisher.buildSearchSql(tableName, { withDocument, top })`. Only chunks that already have an embedding are considered:
+
+```sql
+SELECT "ID" AS "ID", "DOCUMENTID" AS "documentId", "FILENAME" AS "fileName", "CHUNKINDEX" AS "chunkIndex", "CONTENT" AS "content",
+       COSINE_SIMILARITY("EMBEDDING", TO_REAL_VECTOR(VECTOR_EMBEDDING(?, 'QUERY', 'SAP_NEB.20240715'))) AS "score"
+  FROM "MY_APP_DOCUMENTCHUNKS"
+ WHERE "EMBEDDING" IS NOT NULL [AND "DOCUMENTID" = ?]
+ ORDER BY "score" DESC
+ LIMIT 5
+```
+
+The query text and `documentId` are bound as parameters. `top` is checked to be an integer before it goes into the SQL, and the column names come from `options.columns`, so custom entities work too. `wrapToRealVector` applies here as well. On databases other than HANA, `search()` throws `UNSUPPORTED_DATABASE`; with `onUnsupportedDatabase: 'skipEmbeddings'` it falls back to a case-insensitive substring match and returns `score: null`.
+
+To combine the similarity with your own filters, write the CQL yourself:
 
 ```js
 const { DocumentChunks } = cds.entities('my.app');
@@ -217,6 +404,8 @@ const top = await SELECT.from(DocumentChunks)
 ---
 
 ## Large documents: embed in the background
+
+> The [plugin](#quick-start-plugin-mode) does all of this for you in its default `background` mode, including the catch-up job and document statuses.
 
 By default `processAndStore` computes every embedding inside the caller's request. For documents with hundreds or thousands of chunks, the `VECTOR_EMBEDDING` update can take longer than typical approuter or SAP Build Work Zone route timeouts (about 30 s). The HTTP request then fails even though the work itself would have succeeded.
 
@@ -247,6 +436,8 @@ cds.spawn({ every: 15 * 60 * 1000 }, () => publisher.embedPending({ tableName })
 **Handle errors yourself if you need to.** `cds.spawn` only logs errors thrown by its callback. If your app needs to react to failures (alerting, marking the document as failed, …), catch `HanaVectorPublisherError` inside the callback:
 
 ```js
+const { HanaVectorPublisherError } = require('cap-hana-vector-publisher');
+
 cds.spawn(async () => {
   try {
     await publisher.embedPending({ tableName, documentId });
@@ -333,6 +524,8 @@ Returns:
 | `publisher.deleteDocument({ tableName, documentId })` | Deletes all chunks of a document |
 | `publisher.embedPending({ tableName, documentId? })` | Computes embeddings for chunks that don't have one yet (one document, or the whole table without `documentId`). Returns the number of updated rows, or `0` when embeddings are skipped |
 | `publisher.buildEmbeddingSql(tableName, { allPending? })` | Returns the generated `UPDATE` statement, for inspection or logging. `allPending: true` drops the `documentId` condition |
+| `publisher.search({ tableName, query, top?, documentId?, minScore? })` | Similarity search, best match first. Returns `[{ ID, documentId, fileName, chunkIndex, content, score }]` ([details](#3-query-by-similarity-rag)) |
+| `publisher.buildSearchSql(tableName, { withDocument?, top? })` | Returns the generated search statement. Its parameters are `[query]`, or `[query, documentId]` with `withDocument: true` |
 | `chunkText(text, { chunkSize, chunkOverlap })`, `normalizeText(text)`, `extractText(buffer, opts)`, `detectFileType(opts)`, `toBuffer(input, maxBytes)` | Standalone helpers |
 
 ---
@@ -353,6 +546,7 @@ Every error the package throws is a `HanaVectorPublisherError` with `code`, an H
 | `UNSUPPORTED_DATABASE` | 500 | The database isn't HANA and `onUnsupportedDatabase` is `'throw'` |
 | `DB_INSERT_FAILED` | 500 | An `INSERT` or `DELETE` failed |
 | `EMBEDDING_FAILED` | 500 | `VECTOR_EMBEDDING` failed; the message includes a hint about the NLP feature |
+| `SEARCH_FAILED` | 500 | The search statement failed; on HANA the message includes the same NLP hint |
 
 ```js
 catch (err) {
@@ -408,7 +602,27 @@ SQLite has no `VECTOR_EMBEDDING`. You have two options:
   });
   ```
 
-  The `VectorStore` aspect deploys to SQLite as is (`Vector` becomes a `FLOAT32` column), so you don't need a separate model. With `skipEmbeddings`, the `embedding` column stays empty and similarity search only works on HANA. `embed: false` also works on SQLite without `skipEmbeddings`.
+  With `skipEmbeddings`, the `embedding` column stays empty, and `search()` falls back to a plain text match. `embed: false` also works on SQLite without `skipEmbeddings`.
+
+**Deploying the `Vector` type to SQLite.** With `@sap/cds` 9 (cds-compiler 6), the `VectorStore` aspect deploys to SQLite unchanged. With `@sap/cds` 8 (cds-compiler 5), `cds deploy` fails with *Type "cds.Vector" is only supported for SQL dialect 'hana'*. For local development, turn vector elements into `LargeString` when the model loads, for example in `server.js`:
+
+```js
+const cds = require('@sap/cds');
+
+if (!/hana/.test(cds.env.requires.db?.kind)) cds.on('loaded', csn => {
+  for (const def of Object.values(csn.definitions)) {
+    for (const [name, element] of Object.entries(def.elements || {})) {
+      if (element.type !== 'cds.Vector') continue;
+      const { length, ...rest } = element;
+      def.elements[name] = { ...rest, type: 'cds.LargeString' };
+    }
+  }
+});
+
+module.exports = cds.server;
+```
+
+`server.js` is loaded by `cds watch` and `cds serve`, which also covers their in-memory SQLite deployment. The `cds deploy` CLI does not load `server.js`. The plugin applies the same mapping to its own entity automatically.
 
 ---
 
@@ -437,6 +651,13 @@ The workflow authenticates with npm **trusted publishing** (OIDC) once you confi
 ---
 
 ## Changelog
+
+### 1.2.0
+
+- **New: CAP plugin mode (opt-in).** `cds.requires: { "hana-vector-publisher": true }` adds the entities `cap.hana.vector.Documents` and `cap.hana.vector.DocumentChunks` and the `VectorDocumentService` at `/vector` with `upload`, `deleteDocument`, `embedPending`, `search` and read-only `Documents`/`Chunks`. It includes background embedding, document statuses and an embedding catch-up job. Apps without the config entry get nothing new ([details](#quick-start-plugin-mode)).
+- New `publisher.search()` and `publisher.buildSearchSql()` for similarity search, with a text-match fallback on non-HANA databases when `onUnsupportedDatabase: 'skipEmbeddings'` is set ([details](#3-query-by-similarity-rag)). New error code `SEARCH_FAILED`.
+- Fix: small PDFs (under 4 KB) could fail with `EXTRACTION_FAILED: bad XRef entry`, depending on what else the process had allocated. pdf.js copies a Node.js `Buffer` into Node's shared buffer pool and then reads from the wrong offset; the PDF is now passed in as a plain `Uint8Array`.
+- README: corrected the SQLite section again. With `@sap/cds` 8 the `Vector` type cannot be deployed to SQLite; it shows a workaround ([details](#local-development-sqlite)). The `cds.spawn` error-handling example now shows where `HanaVectorPublisherError` comes from.
 
 ### 1.1.1
 
