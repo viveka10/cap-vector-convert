@@ -1,0 +1,104 @@
+'use strict';
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { Readable } = require('node:stream');
+const HanaVectorPublisher = require('..');
+
+function mockDb(kind = 'hana', { failOn } = {}) {
+  return {
+    kind,
+    calls: [],
+    async run(query, args) {
+      this.calls.push({ query, args });
+      if (failOn && failOn(query)) throw new Error('boom');
+      return 1;
+    },
+    async tx(fn) {
+      this.txCount = (this.txCount || 0) + 1;
+      return fn(this);
+    }
+  };
+}
+
+const longText = Array.from({ length: 40 }, (_, i) => `Paragraph ${i} about vectors and “special” chars – ok.`).join('\n\n');
+
+test('constructor validates db and options', () => {
+  assert.throws(() => new HanaVectorPublisher(), { code: 'INVALID_DB' });
+  assert.throws(() => new HanaVectorPublisher(mockDb(), { chunkOverlap: 5000 }), { code: 'INVALID_OPTIONS' });
+  assert.throws(() => new HanaVectorPublisher(mockDb(), { modelId: "x'); DROP TABLE y; --" }), { code: 'INVALID_OPTIONS' });
+});
+
+test('inserts chunks via CQL, then embeds in one UPDATE inside a transaction', async () => {
+  const db = mockDb();
+  const publisher = new HanaVectorPublisher(db, { chunkSize: 200, chunkOverlap: 40, batchSize: 5 });
+  const result = await publisher.processAndStore({ fileBuffer: Buffer.from(longText), fileName: 'doc.txt', tableName: 'my.app.Chunks', metadata: { source: 'test' } });
+
+  assert.equal(db.txCount, 1);
+  assert.equal(result.embedded, true);
+  assert.equal(result.fileType, 'txt');
+
+  const inserts = db.calls.filter(c => c.query.INSERT);
+  const rows = inserts.flatMap(c => c.query.INSERT.entries);
+  assert.equal(rows.length, result.chunkCount);
+  assert.ok(inserts.every(c => c.query.INSERT.entries.length <= 5));
+  assert.deepEqual(rows.map(r => r.chunkIndex), rows.map((_, i) => i));
+  assert.ok(rows.every(r => r.documentId === result.documentId && r.fileName === 'doc.txt' && r.mimeType === 'text/plain'));
+  assert.equal(rows[0].metadata, '{"source":"test"}');
+
+  const update = db.calls.at(-1);
+  assert.equal(
+    update.query,
+    `UPDATE "MY_APP_CHUNKS" SET "EMBEDDING" = TO_REAL_VECTOR(VECTOR_EMBEDDING("CONTENT", 'DOCUMENT', 'SAP_NEB.20240715')) WHERE "DOCUMENTID" = ? AND "EMBEDDING" IS NULL`
+  );
+  assert.deepEqual(update.args, [result.documentId]);
+});
+
+test('accepts readable streams and enforces maxFileSize', async () => {
+  const db = mockDb();
+  const publisher = new HanaVectorPublisher(db, { maxFileSize: 10 });
+  await assert.rejects(
+    publisher.processAndStore({ fileBuffer: Readable.from([Buffer.from('0123456789'), Buffer.from('abc')]), fileName: 'a.txt', tableName: 'T' }),
+    { code: 'FILE_TOO_LARGE', status: 413 }
+  );
+  const ok = await new HanaVectorPublisher(mockDb()).processAndStore({ fileBuffer: Readable.from([Buffer.from('hello stream')]), fileName: 'a.md', tableName: 'T' });
+  assert.equal(ok.chunkCount, 1);
+});
+
+test('throws on non-HANA databases unless skipEmbeddings is set', async () => {
+  const params = { fileBuffer: Buffer.from('text'), fileName: 'a.txt', tableName: 'T' };
+  await assert.rejects(new HanaVectorPublisher(mockDb('sqlite')).processAndStore(params), { code: 'UNSUPPORTED_DATABASE' });
+
+  const db = mockDb('sqlite');
+  const result = await new HanaVectorPublisher(db, { onUnsupportedDatabase: 'skipEmbeddings' }).processAndStore(params);
+  assert.equal(result.embedded, false);
+  assert.ok(db.calls.every(c => typeof c.query !== 'string'));
+});
+
+test('replace deletes existing chunks first', async () => {
+  const db = mockDb();
+  await new HanaVectorPublisher(db).processAndStore({ fileBuffer: Buffer.from('new'), fileName: 'a.txt', tableName: 'T', documentId: 'doc-1', replace: true });
+  assert.ok(db.calls[0].query.DELETE);
+  assert.ok(db.calls[1].query.INSERT);
+});
+
+test('reports empty files and embedding failures with codes', async () => {
+  const publisher = new HanaVectorPublisher(mockDb());
+  await assert.rejects(publisher.processAndStore({ fileBuffer: Buffer.alloc(0), fileName: 'a.txt', tableName: 'T' }), { code: 'INVALID_INPUT' });
+  await assert.rejects(publisher.processAndStore({ fileBuffer: Buffer.from(' \n\u0000 '), fileName: 'a.txt', tableName: 'T' }), { code: 'NO_TEXT_EXTRACTED' });
+
+  const failing = new HanaVectorPublisher(mockDb('hana', { failOn: q => typeof q === 'string' }));
+  await assert.rejects(failing.processAndStore({ fileBuffer: Buffer.from('x'), fileName: 'a.txt', tableName: 'T' }), { code: 'EMBEDDING_FAILED' });
+});
+
+test('custom column mapping and table override', () => {
+  const publisher = new HanaVectorPublisher(mockDb(), {
+    sqlTableName: 'CUSTOM_TABLE',
+    wrapToRealVector: false,
+    columns: { content: 'text', embedding: 'vec', documentId: 'docId' }
+  });
+  assert.equal(
+    publisher.buildEmbeddingSql('ignored.Name'),
+    `UPDATE "CUSTOM_TABLE" SET "VEC" = VECTOR_EMBEDDING("TEXT", 'DOCUMENT', 'SAP_NEB.20240715') WHERE "DOCID" = ? AND "VEC" IS NULL`
+  );
+});
