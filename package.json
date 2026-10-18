@@ -30,6 +30,15 @@
     "chunking"
   ],
   "license": "Apache-2.0",
+  "author": "viveka10",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/viveka10/cap-vector-convert.git"
+  },
+  "homepage": "https://github.com/viveka10/cap-vector-convert#readme",
+  "bugs": {
+    "url": "https://github.com/viveka10/cap-vector-convert/issues"
+  },
   "engines": {
     "node": ">=18"
   },
