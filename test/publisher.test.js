@@ -102,3 +102,79 @@ test('custom column mapping and table override', () => {
     `UPDATE "CUSTOM_TABLE" SET "VEC" = VECTOR_EMBEDDING("TEXT", 'DOCUMENT', 'SAP_NEB.20240715') WHERE "DOCID" = ? AND "VEC" IS NULL`
   );
 });
+
+test('replace: true without documentId is rejected before any SQL runs', async () => {
+  const db = mockDb();
+  await assert.rejects(
+    new HanaVectorPublisher(db).processAndStore({ fileBuffer: Buffer.from('new'), fileName: 'a.txt', tableName: 'T', replace: true }),
+    err => err instanceof HanaVectorPublisher.HanaVectorPublisherError && err.code === 'INVALID_INPUT' && err.status === 400
+  );
+  assert.equal(db.calls.length, 0);
+});
+
+test('wrapToRealVector: true still produces the wrapped expression', () => {
+  const publisher = new HanaVectorPublisher(mockDb(), { sqlTableName: 'T', wrapToRealVector: true });
+  assert.equal(
+    publisher.buildEmbeddingSql('T'),
+    `UPDATE "T" SET "EMBEDDING" = TO_REAL_VECTOR(VECTOR_EMBEDDING("CONTENT", 'DOCUMENT', 'SAP_NEB.20240715')) WHERE "DOCUMENTID" = ? AND "EMBEDDING" IS NULL`
+  );
+  assert.equal(
+    publisher.buildEmbeddingSql('T', { allPending: true }),
+    `UPDATE "T" SET "EMBEDDING" = TO_REAL_VECTOR(VECTOR_EMBEDDING("CONTENT", 'DOCUMENT', 'SAP_NEB.20240715')) WHERE "EMBEDDING" IS NULL`
+  );
+});
+
+test('embed: false stores chunks only', async () => {
+  const db = mockDb();
+  const result = await new HanaVectorPublisher(db).processAndStore({ fileBuffer: Buffer.from(longText), fileName: 'a.txt', tableName: 'T', embed: false });
+  assert.equal(result.embedded, false);
+  assert.equal(result.modelId, undefined);
+  assert.ok(db.calls.length > 0);
+  assert.ok(db.calls.every(c => c.query.INSERT));
+});
+
+test('embed: false works on non-HANA databases even with onUnsupportedDatabase: throw', async () => {
+  const db = mockDb('sqlite');
+  const result = await new HanaVectorPublisher(db, { onUnsupportedDatabase: 'throw' }).processAndStore({
+    fileBuffer: Buffer.from('text'),
+    fileName: 'a.txt',
+    tableName: 'T',
+    embed: false
+  });
+  assert.equal(result.embedded, false);
+});
+
+test('embedPending embeds one document', async () => {
+  const db = mockDb();
+  const count = await new HanaVectorPublisher(db, { sqlTableName: 'T' }).embedPending({ tableName: 'T', documentId: 'doc-1' });
+  assert.equal(count, 1);
+  assert.equal(db.calls.length, 1);
+  assert.match(db.calls[0].query, /^UPDATE "T" SET "EMBEDDING" = .* WHERE "DOCUMENTID" = \? AND "EMBEDDING" IS NULL$/);
+  assert.deepEqual(db.calls[0].args, ['doc-1']);
+  assert.equal(db.txCount, 1);
+});
+
+test('embedPending without documentId embeds every pending row', async () => {
+  const db = mockDb();
+  await new HanaVectorPublisher(db, { sqlTableName: 'T' }).embedPending({ tableName: 'T' });
+  assert.equal(db.calls.length, 1);
+  assert.match(db.calls[0].query, / WHERE "EMBEDDING" IS NULL$/);
+  assert.doesNotMatch(db.calls[0].query, /\?/);
+  assert.equal(db.calls[0].args, undefined);
+});
+
+test('embedPending validates input and respects skipEmbeddings', async () => {
+  const publisher = new HanaVectorPublisher(mockDb());
+  await assert.rejects(publisher.embedPending({}), { code: 'INVALID_INPUT', status: 400 });
+  await assert.rejects(publisher.embedPending({ tableName: 'T', documentId: '' }), { code: 'INVALID_INPUT', status: 400 });
+
+  const db = mockDb('sqlite');
+  assert.equal(await new HanaVectorPublisher(db, { onUnsupportedDatabase: 'skipEmbeddings' }).embedPending({ tableName: 'T' }), 0);
+  assert.equal(db.calls.length, 0);
+  await assert.rejects(new HanaVectorPublisher(mockDb('sqlite')).embedPending({ tableName: 'T' }), { code: 'UNSUPPORTED_DATABASE' });
+});
+
+test('embedPending wraps database errors in EMBEDDING_FAILED', async () => {
+  const publisher = new HanaVectorPublisher(mockDb('hana', { failOn: () => true }));
+  await assert.rejects(publisher.embedPending({ tableName: 'T', documentId: 'doc-1' }), { code: 'EMBEDDING_FAILED', status: 500 });
+});

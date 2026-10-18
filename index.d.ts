@@ -48,7 +48,10 @@ export interface ProcessAndStoreParams {
   tableName: string;
   mimeType?: string;
   documentId?: string;
+  /** Delete existing chunks of documentId first. Requires documentId */
   replace?: boolean;
+  /** false stores the chunks only; compute the vectors later with embedPending(). Default true */
+  embed?: boolean;
   metadata?: Record<string, unknown> | string;
 }
 
@@ -73,7 +76,9 @@ export declare class HanaVectorPublisher {
   extractText(params: { fileBuffer: FileInput; fileName: string; mimeType?: string }): Promise<{ type: 'pdf' | 'txt' | 'md'; text: string; pages?: number }>;
   chunk(text: string): string[];
   deleteDocument(params: { tableName: string; documentId: string }): Promise<number>;
-  buildEmbeddingSql(tableName: string): string;
+  /** Embeds chunks whose embedding is NULL (one document, or the whole table). Returns the updated row count */
+  embedPending(params: { tableName: string; documentId?: string }): Promise<number>;
+  buildEmbeddingSql(tableName: string, opts?: { allPending?: boolean }): string;
 }
 
 export declare const ERROR_CODES: Readonly<{

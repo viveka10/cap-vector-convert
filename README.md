@@ -17,12 +17,14 @@ upload ─► extract text ─► normalize ─► chunk (with overlap) ─► I
 - [1. Extend your schema](#1-extend-your-schema)
 - [2. Use it in a service handler](#2-use-it-in-a-service-handler)
 - [3. Query by similarity (RAG)](#3-query-by-similarity-rag)
+- [Large documents: embed in the background](#large-documents-embed-in-the-background)
 - [Options](#options)
 - [API](#api)
 - [Error handling](#error-handling)
 - [How it works](#how-it-works)
 - [Local development (SQLite)](#local-development-sqlite)
 - [Publishing this package](#publishing-this-package)
+- [Changelog](#changelog)
 
 ---
 
@@ -214,6 +216,30 @@ const top = await SELECT.from(DocumentChunks)
 
 ---
 
+## Large documents: embed in the background
+
+By default `processAndStore` computes every embedding inside the caller's request. For documents with hundreds or thousands of chunks, the `VECTOR_EMBEDDING` update can take longer than typical approuter or SAP Build Work Zone route timeouts (about 30 s). The HTTP request then fails even though the work itself would have succeeded.
+
+To avoid this, store the chunks with `embed: false` and compute the vectors after the request has committed:
+
+```js
+// in the upload handler: fast, chunks only
+const r = await publisher.processAndStore({ fileBuffer, fileName, tableName, embed: false });
+
+// after the request commits, in the background
+cds.spawn({ after: 0 }, () => publisher.embedPending({ tableName, documentId: r.documentId }));
+```
+
+`embedPending({ tableName })` without a `documentId` embeds every row in the table whose embedding is still `NULL`, which is useful in a periodic job that catches up after failures.
+
+Until `embedPending` finishes, those chunks have `embedding IS NULL` and similarity search won't find them. Filter them out in your queries:
+
+```js
+SELECT.from(DocumentChunks).where`embedding is not null`.orderBy`COSINE_SIMILARITY(...) desc`
+```
+
+---
+
 ## Options
 
 All options are optional. Pass them as the second constructor argument.
@@ -224,7 +250,7 @@ All options are optional. Pass them as the second constructor argument.
 | `chunkOverlap` | `150` | Characters of trailing context repeated at the start of the next chunk. Must be smaller than `chunkSize`. |
 | `modelId` | `'SAP_NEB.20240715'` | HANA embedding model. It is validated against `[A-Za-z0-9_.-]`. |
 | `embeddingType` | `'DOCUMENT'` | `'DOCUMENT'` or `'QUERY'`. |
-| `wrapToRealVector` | `true` | Wraps the expression as `TO_REAL_VECTOR(VECTOR_EMBEDDING(...))`. Set to `false` to store the result of `VECTOR_EMBEDDING` directly. |
+| `wrapToRealVector` | `true` | Wraps the expression as `TO_REAL_VECTOR(VECTOR_EMBEDDING(...))`. Set to `false` to store the result of `VECTOR_EMBEDDING` directly. `VECTOR_EMBEDDING` already returns `REAL_VECTOR`, so the wrapper is probably redundant. The default stays `true` until it has been verified on HANA Cloud without the wrapper. |
 | `batchSize` | `200` | Rows per `INSERT` statement. |
 | `maxFileSize` | `52428800` (50 MB) | Larger uploads are rejected, including streams while they are being read. |
 | `maxChunks` | `10000` | Safety limit on the number of chunks per document. |
@@ -262,7 +288,8 @@ Set `id`, `fileName`, `mimeType`, `chunkIndex` or `metadata` to `null` to leave 
 | `tableName` | ✔ | Fully qualified CDS entity name, e.g. `'my.app.DocumentChunks'` |
 | `mimeType` | | Takes precedence over the file extension |
 | `documentId` | | Your own ID for the document. One is generated if you leave it out |
-| `replace` | | `true` deletes the existing chunks of `documentId` first, in the same transaction |
+| `replace` | | `true` deletes the existing chunks of `documentId` first, in the same transaction. Requires `documentId` (otherwise `INVALID_INPUT`) |
+| `embed` | | `false` stores the chunks without computing embeddings; call `embedPending()` later. Default `true` |
 | `metadata` | | An object or JSON string, stored on each chunk |
 
 Returns:
@@ -279,7 +306,8 @@ Returns:
 | `publisher.extractText({ fileBuffer, fileName, mimeType? })` | Returns `{ type, text, pages? }` without writing to the database |
 | `publisher.chunk(text)` | Chunks text using the configured options |
 | `publisher.deleteDocument({ tableName, documentId })` | Deletes all chunks of a document |
-| `publisher.buildEmbeddingSql(tableName)` | Returns the generated `UPDATE` statement, for inspection or logging |
+| `publisher.embedPending({ tableName, documentId? })` | Computes embeddings for chunks that don't have one yet (one document, or the whole table without `documentId`). Returns the number of updated rows, or `0` when embeddings are skipped |
+| `publisher.buildEmbeddingSql(tableName, { allPending? })` | Returns the generated `UPDATE` statement, for inspection or logging. `allPending: true` drops the `documentId` condition |
 | `chunkText(text, { chunkSize, chunkOverlap })`, `normalizeText(text)`, `extractText(buffer, opts)`, `detectFileType(opts)`, `toBuffer(input, maxBytes)` | Standalone helpers |
 
 ---
@@ -334,6 +362,8 @@ catch (err) {
     WHERE "DOCUMENTID" = ? AND "EMBEDDING" IS NULL
    ```
 
+   The `TO_REAL_VECTOR(...)` wrapper comes from the `wrapToRealVector` option (default `true`). With `wrapToRealVector: false`, the statement sets `"EMBEDDING" = VECTOR_EMBEDDING(...)` directly.
+
    This is a separate step because CQL binds every value in `INSERT.entries()` as a parameter, so a SQL function like `VECTOR_EMBEDDING()` can't be placed there. As a side benefit, HANA reads the text from the column it just stored, so the text is sent to the database only once. The model ID and embedding type are strictly validated before they are placed in the SQL, and the document ID is bound as a parameter.
 
 Steps 6 and 7 run in a single transaction. Inside a CAP request that is the request's own transaction; outside a request it is a dedicated `db.tx()`.
@@ -353,7 +383,7 @@ SQLite has no `VECTOR_EMBEDDING`. You have two options:
   });
   ```
 
-  SQLite has no vector column type either. Leave the `Vector` element out of the SQLite model, or keep the aspect HANA-only through a profile-specific model.
+  The `VectorStore` aspect deploys to SQLite as is (`Vector` becomes a `FLOAT32` column), so you don't need a separate model. With `skipEmbeddings`, the `embedding` column stays empty and similarity search only works on HANA. `embed: false` also works on SQLite without `skipEmbeddings`.
 
 ---
 
@@ -378,6 +408,17 @@ git push --follow-tags           # the tag push triggers the publish workflow
 ```
 
 The workflow authenticates with npm **trusted publishing** (OIDC) once you configure it under the package's *Settings → Trusted Publisher* on npmjs.com (workflow `publish.yml`, environment `npm`). Until then, it falls back to an `NPM_TOKEN` repository secret.
+
+---
+
+## Changelog
+
+### 1.1.0
+
+- `processAndStore` rejects `replace: true` without a `documentId` (`INVALID_INPUT`). Before, old chunks silently stayed and new ones were added next to them.
+- New `embed: false` option on `processAndStore` and new `embedPending()` method to compute embeddings outside the upload request ([details](#large-documents-embed-in-the-background)). `buildEmbeddingSql()` accepts `{ allPending: true }`.
+- `wrapToRealVector`: the README now notes that the `TO_REAL_VECTOR` wrapper is probably redundant. The default is still `true` until it has been verified on HANA Cloud.
+- README: corrected the SQLite section. The `VectorStore` aspect deploys to SQLite unchanged.
 
 ---
 
